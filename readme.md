@@ -21,6 +21,10 @@ punt <TARGET> [OPTIONS]
 | `--batch-size` | `-b` | `5000` | Concurrent connections per batch |
 | `--banners` | | `off` | Grab service banners |
 | `--probe` | | `off` | HTTP/HTTPS header probing |
+| `--audit` | | `off` | Security audit for basic shit  |
+| `--tls` | | `off` | Certificate inspection |
+| `--json` | | `off` | export to json |
+
 
 ## Examples
 ```bash
