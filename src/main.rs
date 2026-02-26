@@ -39,21 +39,57 @@ struct Args {
     /// Probe open ports with HTTP/HTTPS requests
     #[arg(long, default_value_t = false)]
     probe: bool,
+
+    /// Analyze security headers on probed ports
+    #[arg(long, default_value_t = false)]
+    audit: bool,
 }
 
 struct ScanResult {
     port: u16,
     banner: Option<String>,
     http_info: Option<HttpInfo>,
+    findings: Vec<Finding>,
 }
 
 struct HttpInfo {
     status: u16,
     headers: HashMap<String, String>,
+    scheme: String,
+}
+
+#[derive(PartialEq, Eq, PartialOrd, Ord, Clone)]
+enum Severity {
+    High,
+    Medium,
+    Info,
+}
+
+impl Severity {
+    fn label(&self) -> ColoredString {
+        match self {
+            Severity::High => "HIGH".red().bold(),
+            Severity::Medium => "MED".yellow().bold(),
+            Severity::Info => "INFO".blue(),
+        }
+    }
+
+    fn icon(&self) -> ColoredString {
+        match self {
+            Severity::High => "✗".red().bold(),
+            Severity::Medium => "⚠".yellow(),
+            Severity::Info => "○".blue(),
+        }
+    }
+}
+
+struct Finding {
+    severity: Severity,
+    title: String,
+    detail: String,
 }
 
 impl HttpInfo {
-    /// Returns the most interesting headers in a compact display string
     fn summary(&self) -> String {
         let interesting = [
             "server",
@@ -78,6 +114,99 @@ impl HttpInfo {
     }
 }
 
+fn audit_headers(port: u16, info: &HttpInfo) -> Vec<Finding> {
+    let mut findings: Vec<Finding> = Vec::new();
+
+    // HIGH: Version info leaking
+    if let Some(server) = info.headers.get("server") {
+        // Check if it contains version numbers (not just a generic name)
+        if server.chars().any(|c| c.is_ascii_digit()) {
+            findings.push(Finding {
+                severity: Severity::High,
+                title: "Server header leaks version".to_string(),
+                detail: format!(":{} — Server: {} (aids targeted exploits)", port, server),
+            });
+        }
+    }
+
+    if let Some(powered) = info.headers.get("x-powered-by") {
+        findings.push(Finding {
+            severity: Severity::High,
+            title: "X-Powered-By header present".to_string(),
+            detail: format!(":{} — X-Powered-By: {} (disclose framework/version)", port, powered),
+        });
+    }
+
+    if let Some(aspnet) = info.headers.get("x-aspnet-version") {
+        findings.push(Finding {
+            severity: Severity::High,
+            title: "X-AspNet-Version header present".to_string(),
+            detail: format!(":{} — X-AspNet-Version: {} (disclose runtime version)", port, aspnet),
+        });
+    }
+
+    // HIGH: Missing HSTS on HTTPS
+    if info.scheme == "https" && !info.headers.contains_key("strict-transport-security") {
+        findings.push(Finding {
+            severity: Severity::High,
+            title: "Missing Strict-Transport-Security".to_string(),
+            detail: format!(":{} — HTTPS without HSTS, vulnerable to downgrade attacks", port),
+        });
+    }
+
+    // MEDIUM: Missing core security headers
+    if !info.headers.contains_key("x-content-type-options") {
+        findings.push(Finding {
+            severity: Severity::Medium,
+            title: "Missing X-Content-Type-Options".to_string(),
+            detail: format!(":{} — should be 'nosniff' to prevent MIME-type sniffing", port),
+        });
+    } else if let Some(val) = info.headers.get("x-content-type-options") {
+        if val.to_lowercase() != "nosniff" {
+            findings.push(Finding {
+                severity: Severity::Medium,
+                title: "X-Content-Type-Options misconfigured".to_string(),
+                detail: format!(":{} — value is '{}', should be 'nosniff'", port, val),
+            });
+        }
+    }
+
+    if !info.headers.contains_key("x-frame-options") {
+        findings.push(Finding {
+            severity: Severity::Medium,
+            title: "Missing X-Frame-Options".to_string(),
+            detail: format!(":{} — page can be embedded in iframes (clickjacking risk)", port),
+        });
+    }
+
+    // INFO: Nice-to-have headers
+    if !info.headers.contains_key("content-security-policy") {
+        findings.push(Finding {
+            severity: Severity::Info,
+            title: "Missing Content-Security-Policy".to_string(),
+            detail: format!(":{} — no CSP, reduced XSS protection", port),
+        });
+    }
+
+    if !info.headers.contains_key("referrer-policy") {
+        findings.push(Finding {
+            severity: Severity::Info,
+            title: "Missing Referrer-Policy".to_string(),
+            detail: format!(":{} — browser will send full referrer by default", port),
+        });
+    }
+
+    if !info.headers.contains_key("permissions-policy") {
+        findings.push(Finding {
+            severity: Severity::Info,
+            title: "Missing Permissions-Policy".to_string(),
+            detail: format!(":{} — no restrictions on browser features (camera, mic, etc.)", port),
+        });
+    }
+
+    findings
+}
+
 fn print_banner() {
     let banner = r#"
     ██████╗ ██╗   ██╗███╗   ██╗████████╗
@@ -95,11 +224,7 @@ fn print_banner() {
 
     let taglines = [
         "because nmap was too mainstream",
-        "it's not illegal if you own it",
-        "scanning ports, not your emails",
-        "loud and proud on your network",
         "RST packets go brrrrr",
-        "enterprise-grade shitposting",
         "now with 100% more Rust",
         "blazingly fast (we're contractually obligated to say that)",
         "i am not scraping your data, i don't know how",
@@ -129,6 +254,7 @@ async fn scan_port(addr: SocketAddr, conn_timeout: Duration, grab_banner: bool) 
             port,
             banner: None,
             http_info: None,
+            findings: Vec::new(),
         });
     }
 
@@ -152,12 +278,11 @@ async fn scan_port(addr: SocketAddr, conn_timeout: Duration, grab_banner: bool) 
         port,
         banner,
         http_info: None,
+        findings: Vec::new(),
     })
 }
 
 async fn probe_http(target: &str, port: u16, conn_timeout: Duration) -> Option<HttpInfo> {
-    // Try HTTPS first for common HTTPS ports, then fall back to HTTP
-    // For other ports, try HTTP first, then HTTPS
     let schemes = if matches!(port, 443 | 8443 | 8006 | 9443) {
         vec!["https", "http"]
     } else {
@@ -166,8 +291,8 @@ async fn probe_http(target: &str, port: u16, conn_timeout: Duration) -> Option<H
 
     let client = reqwest::Client::builder()
         .timeout(conn_timeout)
-        .danger_accept_invalid_certs(true) // self-signed certs are common internally
-        .redirect(reqwest::redirect::Policy::none()) // don't follow redirects, we want raw response
+        .danger_accept_invalid_certs(true)
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .ok()?;
 
@@ -187,7 +312,11 @@ async fn probe_http(target: &str, port: u16, conn_timeout: Duration) -> Option<H
                 }
             }
 
-            return Some(HttpInfo { status, headers });
+            return Some(HttpInfo {
+                status,
+                headers,
+                scheme: scheme.to_string(),
+            });
         }
     }
 
@@ -213,6 +342,9 @@ async fn main() {
     let conn_timeout = Duration::from_millis(args.timeout);
     let total_ports = (args.end_port - args.start_port + 1) as u64;
 
+    // --audit implies --probe (need headers to audit)
+    let do_probe = args.probe || args.audit;
+
     print_banner();
     print_divider();
 
@@ -229,7 +361,7 @@ async fn main() {
         format!("{} ports", total_ports).dimmed()
     );
     println!(
-        "    {} {}ms  {} {}  {} {}  {} {}",
+        "    {} {}ms  {} {}  {} {}  {} {}  {} {}",
         "TIMEOUT:".bold(),
         args.timeout,
         "BATCH:".bold(),
@@ -237,7 +369,9 @@ async fn main() {
         "BANNERS:".bold(),
         if args.banners { "on".green().to_string() } else { "off".dimmed().to_string() },
         "PROBE:".bold(),
-        if args.probe { "on".green().to_string() } else { "off".dimmed().to_string() }
+        if do_probe { "on".green().to_string() } else { "off".dimmed().to_string() },
+        "AUDIT:".bold(),
+        if args.audit { "on".green().to_string() } else { "off".dimmed().to_string() }
     );
 
     print_divider();
@@ -283,8 +417,8 @@ async fn main() {
 
     progress.finish_and_clear();
 
-    // Phase 2: HTTP probing on open ports
-    if args.probe && !results.is_empty() {
+    // Phase 2: HTTP probing
+    if do_probe && !results.is_empty() {
         println!(
             "    {} probing {} open {} for HTTP/HTTPS...",
             "→".cyan(),
@@ -300,7 +434,6 @@ async fn main() {
                 .progress_chars("█▓░")
         );
 
-        // Probe with longer timeout — HTTP handshakes + TLS take more time
         let probe_timeout = Duration::from_secs(5);
 
         for result in results.iter_mut() {
@@ -309,6 +442,15 @@ async fn main() {
         }
 
         probe_progress.finish_and_clear();
+    }
+
+    // Phase 3: Security header audit
+    if args.audit {
+        for result in results.iter_mut() {
+            if let Some(info) = &result.http_info {
+                result.findings = audit_headers(result.port, info);
+            }
+        }
     }
 
     let elapsed = start_time.elapsed();
@@ -323,11 +465,9 @@ async fn main() {
         println!("    {} No open ports found. Either it's locked down", "¯\\_(ツ)_/¯".yellow());
         println!("    or something went wrong. Try a longer timeout?");
     } else {
-        // Determine which columns to show
         let show_banner = args.banners;
-        let show_probe = args.probe;
+        let show_probe = do_probe;
 
-        // Header
         print!("    {:<12} {:<10}", "PORT".bold(), "STATE".bold());
         if show_banner { print!(" {:<30}", "BANNER".bold()); }
         if show_probe { print!(" {}", "HTTP".bold()); }
@@ -371,7 +511,7 @@ async fn main() {
             println!();
         }
 
-        // If probing, show detailed headers for ports that responded
+        // Headers section
         if show_probe {
             let http_results: Vec<&ScanResult> = results
                 .iter()
@@ -392,7 +532,6 @@ async fn main() {
                         info.status.to_string().yellow()
                     );
 
-                    // Show all captured headers, sorted
                     let mut sorted_headers: Vec<(&String, &String)> =
                         info.headers.iter().collect();
                     sorted_headers.sort_by_key(|(k, _)| k.to_lowercase());
@@ -410,6 +549,88 @@ async fn main() {
                         );
                     }
                 }
+            }
+        }
+
+        // Audit section
+        if args.audit {
+            let all_findings: Vec<(&ScanResult, &Finding)> = results
+                .iter()
+                .flat_map(|r| r.findings.iter().map(move |f| (r, f)))
+                .collect();
+
+            if !all_findings.is_empty() {
+                println!();
+                println!("    {}", "SECURITY AUDIT".bold().underline());
+                println!();
+
+                // Count by severity
+                let high_count = all_findings.iter()
+                    .filter(|(_, f)| f.severity == Severity::High).count();
+                let med_count = all_findings.iter()
+                    .filter(|(_, f)| f.severity == Severity::Medium).count();
+                let info_count = all_findings.iter()
+                    .filter(|(_, f)| f.severity == Severity::Info).count();
+
+                println!(
+                    "    {}  {}  {}",
+                    format!("{} HIGH", high_count).red().bold(),
+                    format!("{} MED", med_count).yellow().bold(),
+                    format!("{} INFO", info_count).blue(),
+                );
+                println!();
+
+                // Print HIGH findings
+                let highs: Vec<&(&ScanResult, &Finding)> = all_findings.iter()
+                    .filter(|(_, f)| f.severity == Severity::High).collect();
+                if !highs.is_empty() {
+                    for (_, finding) in &highs {
+                        println!(
+                            "    {} [{}] {}",
+                            finding.severity.icon(),
+                            finding.severity.label(),
+                            finding.title.bold()
+                        );
+                        println!("           {}", finding.detail.dimmed());
+                    }
+                    println!();
+                }
+
+                // Print MEDIUM findings
+                let meds: Vec<&(&ScanResult, &Finding)> = all_findings.iter()
+                    .filter(|(_, f)| f.severity == Severity::Medium).collect();
+                if !meds.is_empty() {
+                    for (_, finding) in &meds {
+                        println!(
+                            "    {} [{}]  {}",
+                            finding.severity.icon(),
+                            finding.severity.label(),
+                            finding.title.bold()
+                        );
+                        println!("           {}", finding.detail.dimmed());
+                    }
+                    println!();
+                }
+
+                // Print INFO findings
+                let infos: Vec<&(&ScanResult, &Finding)> = all_findings.iter()
+                    .filter(|(_, f)| f.severity == Severity::Info).collect();
+                if !infos.is_empty() {
+                    for (_, finding) in &infos {
+                        println!(
+                            "    {} [{}] {}",
+                            finding.severity.icon(),
+                            finding.severity.label(),
+                            finding.title
+                        );
+                        println!("           {}", finding.detail.dimmed());
+                    }
+                }
+            } else {
+                println!();
+                println!("    {}", "SECURITY AUDIT".bold().underline());
+                println!();
+                println!("    {} No findings. Headers look solid.", "✓".green().bold());
             }
         }
     }
@@ -440,6 +661,22 @@ async fn main() {
         total_ports.to_string().bold(),
         format_duration(elapsed).yellow()
     );
+
+    if args.audit {
+        let total_findings: usize = results.iter().map(|r| r.findings.len()).sum();
+        let high_total: usize = results.iter()
+            .flat_map(|r| r.findings.iter())
+            .filter(|f| f.severity == Severity::High)
+            .count();
+
+        if total_findings > 0 {
+            println!(
+                "    {} security findings ({} high)",
+                total_findings.to_string().yellow().bold(),
+                high_total.to_string().red().bold()
+            );
+        }
+    }
 
     let signoffs = [
         "good luck!",
