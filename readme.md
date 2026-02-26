@@ -5,8 +5,8 @@
     ██╔═══╝ ██║   ██║██║╚██╗██║   ██║
     ██║     ╚██████╔╝██║ ╚████║   ██║
     ╚═╝      ╚═════╝ ╚═╝  ╚═══╝   ╚═╝
+Port Utility for Network Testing — an async port scanner in Rust.
 ```
-Port Utility for Network Testing — a fast, async port scanner in Rust.
 
 ## Usage
 ```
