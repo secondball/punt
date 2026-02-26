@@ -54,6 +54,10 @@ struct Args {
     /// Inspect TLS certificates on open ports
     #[arg(long, default_value_t = false)]
     tls: bool,
+
+    /// Output results as JSON
+    #[arg(long, default_value_t = false)]
+    json: bool,
 }
 
 struct ScanResult {
@@ -588,6 +592,53 @@ fn format_duration(duration: Duration) -> String {
     }
 }
 
+use serde::Serialize;
+
+#[derive(Serialize)]
+struct JsonOutput {
+    target: String,
+    ports_scanned: u64,
+    scan_duration: String,
+    results: Vec<JsonPortResult>,
+}
+
+#[derive(Serialize)]
+struct JsonPortResult {
+    port: u16,
+    state: String,
+    banner: Option<String>,
+    http: Option<JsonHttp>,
+    tls: Option<JsonTls>,
+    findings: Vec<JsonFinding>,
+}
+
+#[derive(Serialize)]
+struct JsonHttp {
+    status: u16,
+    scheme: String,
+    headers: HashMap<String, String>,
+}
+
+#[derive(Serialize)]
+struct JsonTls {
+    subject: String,
+    issuer: String,
+    not_before: String,
+    not_after: String,
+    days_until_expiry: i64,
+    sans: Vec<String>,
+    tls_version: String,
+    cipher_suite: String,
+    self_signed: bool,
+}
+
+#[derive(Serialize)]
+struct JsonFinding {
+    severity: String,
+    title: String,
+    detail: String,
+}
+
 #[tokio::main]
 
 async fn main() {
@@ -1013,6 +1064,60 @@ async fn main() {
                 high_total.to_string().red().bold()
             );
         }
+    }
+
+// JSON output
+    if args.json {
+        let json_results: Vec<JsonPortResult> = results.iter().map(|r| {
+            JsonPortResult {
+                port: r.port,
+                state: "open".to_string(),
+                banner: r.banner.clone(),
+                http: r.http_info.as_ref().map(|h| JsonHttp {
+                    status: h.status,
+                    scheme: h.scheme.clone(),
+                    headers: h.headers.clone(),
+                }),
+                tls: r.tls_info.as_ref().map(|t| JsonTls {
+                    subject: t.subject.clone(),
+                    issuer: t.issuer.clone(),
+                    not_before: t.not_before.clone(),
+                    not_after: t.not_after.clone(),
+                    days_until_expiry: t.days_until_expiry,
+                    sans: t.sans.clone(),
+                    tls_version: t.tls_version.clone(),
+                    cipher_suite: t.cipher_suite.clone(),
+                    self_signed: t.self_signed,
+                }),
+                findings: r.findings.iter().map(|f| JsonFinding {
+                    severity: match f.severity {
+                        Severity::High => "high",
+                        Severity::Medium => "medium",
+                        Severity::Info => "info",
+                    }.to_string(),
+                    title: f.title.clone(),
+                    detail: f.detail.clone(),
+                }).collect(),
+            }
+        }).collect();
+
+        let output = JsonOutput {
+            target: args.target.clone(),
+            ports_scanned: total_ports,
+            scan_duration: format_duration(elapsed),
+            results: json_results,
+        };
+
+        let json_string = serde_json::to_string_pretty(&output).expect("Failed to serialize JSON");
+
+        // Write to file
+        let filename = format!("punt_{}.json", args.target.replace(".", "_"));
+        std::fs::write(&filename, &json_string).expect("Failed to write JSON file");
+        println!(
+            "    {} saved to {}",
+            "→".cyan(),
+            filename.bold()
+        );
     }
 
     let signoffs = [
