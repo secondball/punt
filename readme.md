@@ -29,7 +29,7 @@ punt <TARGET> [OPTIONS]
 ## Examples
 ```bash
 punt 192.168.1.1 -e 65535                        # full port range
-punt 192.168.1.1 -e 65535 --banners --probe      # recon mode
+punt 192.168.1.1 -e 65535 --banners --probe      # pull banners and headers
 punt 192.168.1.1 -e 65535 -t 200 -b 10000        # speed run
 ```
 
@@ -37,15 +37,15 @@ punt 192.168.1.1 -e 65535 -t 200 -b 10000        # speed run
 - [x] Async TCP connect scanning
 - [x] Banner grabbing
 - [x] HTTP/HTTPS header probing
-- [ ] Security header analysis
-- [ ] TLS certificate inspection
+- [x] Security header analysis
+- [x] TLS certificate inspection
 - [ ] CVE lookup
-- [ ] JSON output
+- [x] JSON output
 - [ ] CIDR range scanning
 
 ## Install
 ```bash
-git clone https://github.com/YOURUSERNAME/punt.git
+git clone https://github.com/secondball/punt.git
 cd punt
 cargo build --release
 ```
