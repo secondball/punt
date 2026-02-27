@@ -1,26 +1,25 @@
-use std::collections::HashMap;
+mod models;
+mod scanner;
+mod probe;
+mod tls;
+mod audit;
+mod output;
+mod target;
+
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::net::TcpStream;
-use tokio::time::timeout;
-use tokio::io::AsyncReadExt;
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
 use colored::*;
-use rand::seq::IndexedRandom;
-use rustls::ClientConfig;
-use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::DigitallySignedStruct;
-use tokio_rustls::TlsConnector;
-use x509_parser::prelude::*;
+
+use crate::models::Severity;
+use crate::output::*;
 
 /// A fast, async port scanner built in Rust
 #[derive(Parser)]
 #[command(name = "punt", version = "0.1.0")]
 struct Args {
-    /// Target IP address or hostname
+    /// Target IP, hostname, or CIDR range (e.g., 192.168.1.0/24)
     target: String,
 
     /// Start of port range
@@ -60,618 +59,121 @@ struct Args {
     json: bool,
 }
 
-struct ScanResult {
-    port: u16,
-    banner: Option<String>,
-    http_info: Option<HttpInfo>,
-    tls_info: Option<TlsInfo>,
-    findings: Vec<Finding>,
-}
-
-struct HttpInfo {
-    status: u16,
-    headers: HashMap<String, String>,
-    scheme: String,
-}
-
-struct TlsInfo {
-    subject: String,
-    issuer: String,
-    not_before: String,
-    not_after: String,
-    days_until_expiry: i64,
-    sans: Vec<String>,
-    tls_version: String,
-    cipher_suite: String,
-    self_signed: bool,
-}
-
-#[derive(PartialEq, Eq, PartialOrd, Ord, Clone)]
-enum Severity {
-    High,
-    Medium,
-    Info,
-}
-
-impl Severity {
-    fn label(&self) -> ColoredString {
-        match self {
-            Severity::High => "HIGH".red().bold(),
-            Severity::Medium => "MED".yellow().bold(),
-            Severity::Info => "INFO".blue(),
-        }
-    }
-
-    fn icon(&self) -> ColoredString {
-        match self {
-            Severity::High => "✗".red().bold(),
-            Severity::Medium => "⚠".yellow(),
-            Severity::Info => "○".blue(),
-        }
-    }
-}
-
-struct Finding {
-    severity: Severity,
-    title: String,
-    detail: String,
-}
-
-impl HttpInfo {
-    fn summary(&self) -> String {
-        let interesting = [
-            "server",
-            "x-powered-by",
-            "x-aspnet-version",
-            "x-generator",
-        ];
-
-        let mut parts: Vec<String> = Vec::new();
-
-        for key in &interesting {
-            if let Some(val) = self.headers.get(*key) {
-                parts.push(format!("{}: {}", key, val));
-            }
-        }
-
-        if parts.is_empty() {
-            format!("HTTP {}", self.status)
-        } else {
-            format!("HTTP {} | {}", self.status, parts.join(" | "))
-        }
-    }
-}
-
-// Custom TLS verifier that accepts any certificate (we want to inspect, not reject)
-#[derive(Debug)]
-struct AcceptAnyCert;
-
-impl ServerCertVerifier for AcceptAnyCert {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: UnixTime,
-    ) -> Result<ServerCertVerified, rustls::Error> {
-        Ok(ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        Ok(HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        vec![
-            rustls::SignatureScheme::RSA_PKCS1_SHA256,
-            rustls::SignatureScheme::RSA_PKCS1_SHA384,
-            rustls::SignatureScheme::RSA_PKCS1_SHA512,
-            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
-            rustls::SignatureScheme::ECDSA_NISTP521_SHA512,
-            rustls::SignatureScheme::RSA_PSS_SHA256,
-            rustls::SignatureScheme::RSA_PSS_SHA384,
-            rustls::SignatureScheme::RSA_PSS_SHA512,
-            rustls::SignatureScheme::ED25519,
-            rustls::SignatureScheme::ED448,
-        ]
-    }
-}
-
-async fn inspect_tls(target: &str, port: u16, conn_timeout: Duration) -> Option<TlsInfo> {
-    // Build a TLS config that accepts any cert
-    let config = ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(AcceptAnyCert))
-        .with_no_client_auth();
-
-    let connector = TlsConnector::from(Arc::new(config));
-
-    // Connect TCP first
-    let addr: SocketAddr = format!("{}:{}", target, port).parse().ok()?;
-    let tcp_stream = match timeout(conn_timeout, TcpStream::connect(addr)).await {
-        Ok(Ok(s)) => s,
-        _ => return None,
-    };
-
-    // Do TLS handshake
-    let server_name = ServerName::try_from(target.to_string()).unwrap_or(
-        ServerName::try_from("invalid".to_string()).unwrap()
-    );
-
-    let tls_stream = match timeout(conn_timeout, connector.connect(server_name, tcp_stream)).await {
-        Ok(Ok(s)) => s,
-        _ => return None,
-    };
-
-    // Extract connection info
-    let (_, client_conn) = tls_stream.get_ref();
-
-    let tls_version = match client_conn.protocol_version() {
-        Some(rustls::ProtocolVersion::TLSv1_0) => "TLS 1.0".to_string(),
-        Some(rustls::ProtocolVersion::TLSv1_1) => "TLS 1.1".to_string(),
-        Some(rustls::ProtocolVersion::TLSv1_2) => "TLS 1.2".to_string(),
-        Some(rustls::ProtocolVersion::TLSv1_3) => "TLS 1.3".to_string(),
-        Some(v) => format!("{:?}", v),
-        None => "Unknown".to_string(),
-    };
-
-    let cipher_suite = client_conn
-        .negotiated_cipher_suite()
-        .map(|cs| format!("{:?}", cs.suite()))
-        .unwrap_or("Unknown".to_string());
-
-    // Get the peer certificate
-    let certs = client_conn.peer_certificates()?;
-    let cert_der = certs.first()?;
-
-    // Parse the certificate
-    let (_, cert) = X509Certificate::from_der(cert_der.as_ref()).ok()?;
-
-    let subject = cert.subject().to_string();
-    let issuer = cert.issuer().to_string();
-    let self_signed = cert.subject() == cert.issuer();
-
-    let not_before = cert.validity().not_before.to_rfc2822().unwrap_or("Unknown".to_string());
-    let not_after = cert.validity().not_after.to_rfc2822().unwrap_or("Unknown".to_string());
-
-    // Calculate days until expiry
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
-    let expiry = cert.validity().not_after.timestamp();
-    let days_until_expiry = (expiry - now) / 86400;
-
-    // Extract SANs
-    let mut sans: Vec<String> = Vec::new();
-    if let Ok(Some(san_ext)) = cert.subject_alternative_name() {
-        for name in &san_ext.value.general_names {
-            match name {
-                GeneralName::DNSName(dns) => sans.push(dns.to_string()),
-                GeneralName::IPAddress(ip) => {
-                    if ip.len() == 4 {
-                        sans.push(format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]));
-                    } else {
-                        sans.push(format!("{:?}", ip));
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    Some(TlsInfo {
-        subject,
-        issuer,
-        not_before,
-        not_after,
-        days_until_expiry,
-        sans,
-        tls_version,
-        cipher_suite,
-        self_signed,
-    })
-}
-
-fn audit_headers(port: u16, info: &HttpInfo) -> Vec<Finding> {
-    let mut findings: Vec<Finding> = Vec::new();
-
-    if let Some(server) = info.headers.get("server") {
-        if server.chars().any(|c| c.is_ascii_digit()) {
-            findings.push(Finding {
-                severity: Severity::High,
-                title: "Server header leaks version".to_string(),
-                detail: format!(":{} — Server: {} (aids targeted exploits)", port, server),
-            });
-        }
-    }
-
-    if let Some(powered) = info.headers.get("x-powered-by") {
-        findings.push(Finding {
-            severity: Severity::High,
-            title: "X-Powered-By header present".to_string(),
-            detail: format!(":{} — X-Powered-By: {} (disclose framework/version)", port, powered),
-        });
-    }
-
-    if let Some(aspnet) = info.headers.get("x-aspnet-version") {
-        findings.push(Finding {
-            severity: Severity::High,
-            title: "X-AspNet-Version header present".to_string(),
-            detail: format!(":{} — X-AspNet-Version: {} (disclose runtime version)", port, aspnet),
-        });
-    }
-
-    if info.scheme == "https" && !info.headers.contains_key("strict-transport-security") {
-        findings.push(Finding {
-            severity: Severity::High,
-            title: "Missing Strict-Transport-Security".to_string(),
-            detail: format!(":{} — HTTPS without HSTS, vulnerable to downgrade attacks", port),
-        });
-    }
-
-    if !info.headers.contains_key("x-content-type-options") {
-        findings.push(Finding {
-            severity: Severity::Medium,
-            title: "Missing X-Content-Type-Options".to_string(),
-            detail: format!(":{} — should be 'nosniff' to prevent MIME-type sniffing", port),
-        });
-    } else if let Some(val) = info.headers.get("x-content-type-options") {
-        if val.to_lowercase() != "nosniff" {
-            findings.push(Finding {
-                severity: Severity::Medium,
-                title: "X-Content-Type-Options misconfigured".to_string(),
-                detail: format!(":{} — value is '{}', should be 'nosniff'", port, val),
-            });
-        }
-    }
-
-    if !info.headers.contains_key("x-frame-options") {
-        findings.push(Finding {
-            severity: Severity::Medium,
-            title: "Missing X-Frame-Options".to_string(),
-            detail: format!(":{} — page can be embedded in iframes (clickjacking risk)", port),
-        });
-    }
-
-    if !info.headers.contains_key("content-security-policy") {
-        findings.push(Finding {
-            severity: Severity::Info,
-            title: "Missing Content-Security-Policy".to_string(),
-            detail: format!(":{} — no CSP, reduced XSS protection", port),
-        });
-    }
-
-    if !info.headers.contains_key("referrer-policy") {
-        findings.push(Finding {
-            severity: Severity::Info,
-            title: "Missing Referrer-Policy".to_string(),
-            detail: format!(":{} — browser will send full referrer by default", port),
-        });
-    }
-
-    if !info.headers.contains_key("permissions-policy") {
-        findings.push(Finding {
-            severity: Severity::Info,
-            title: "Missing Permissions-Policy".to_string(),
-            detail: format!(":{} — no restrictions on browser features (camera, mic, etc.)", port),
-        });
-    }
-
-    findings
-}
-
-fn audit_tls(port: u16, info: &TlsInfo) -> Vec<Finding> {
-    let mut findings: Vec<Finding> = Vec::new();
-
-    // Expired cert
-    if info.days_until_expiry < 0 {
-        findings.push(Finding {
-            severity: Severity::High,
-            title: "TLS certificate expired".to_string(),
-            detail: format!(":{} — expired {} days ago", port, info.days_until_expiry.abs()),
-        });
-    } else if info.days_until_expiry <= 30 {
-        findings.push(Finding {
-            severity: Severity::Medium,
-            title: "TLS certificate expiring soon".to_string(),
-            detail: format!(":{} — expires in {} days", port, info.days_until_expiry),
-        });
-    }
-
-    // Self-signed
-    if info.self_signed {
-        findings.push(Finding {
-            severity: Severity::Medium,
-            title: "Self-signed certificate".to_string(),
-            detail: format!(":{} — not issued by a trusted CA", port),
-        });
-    }
-
-    // Weak TLS version
-    match info.tls_version.as_str() {
-        "TLS 1.0" => {
-            findings.push(Finding {
-                severity: Severity::High,
-                title: "TLS 1.0 in use".to_string(),
-                detail: format!(":{} — deprecated, known vulnerabilities (BEAST, POODLE)", port),
-            });
-        }
-        "TLS 1.1" => {
-            findings.push(Finding {
-                severity: Severity::High,
-                title: "TLS 1.1 in use".to_string(),
-                detail: format!(":{} — deprecated since 2021, upgrade to 1.2+", port),
-            });
-        }
-        "TLS 1.2" => {
-            findings.push(Finding {
-                severity: Severity::Info,
-                title: "TLS 1.2 in use".to_string(),
-                detail: format!(":{} — acceptable, but TLS 1.3 is preferred", port),
-            });
-        }
-        _ => {}
-    }
-
-    // Check for weak cipher suites
-    let cipher_lower = info.cipher_suite.to_lowercase();
-    if cipher_lower.contains("rc4") {
-        findings.push(Finding {
-            severity: Severity::High,
-            title: "RC4 cipher in use".to_string(),
-            detail: format!(":{} — {} (broken, trivially exploitable)", port, info.cipher_suite),
-        });
-    } else if cipher_lower.contains("des") || cipher_lower.contains("3des") {
-        findings.push(Finding {
-            severity: Severity::High,
-            title: "DES/3DES cipher in use".to_string(),
-            detail: format!(":{} — {} (weak, vulnerable to Sweet32)", port, info.cipher_suite),
-        });
-    } else if cipher_lower.contains("null") {
-        findings.push(Finding {
-            severity: Severity::High,
-            title: "NULL cipher in use".to_string(),
-            detail: format!(":{} — {} (no encryption!)", port, info.cipher_suite),
-        });
-    } else if cipher_lower.contains("cbc") {
-        findings.push(Finding {
-            severity: Severity::Info,
-            title: "CBC mode cipher in use".to_string(),
-            detail: format!(":{} — {} (GCM or CHACHA20 preferred)", port, info.cipher_suite),
-        });
-    }
-
-    findings
-}
-
-fn print_banner() {
-    let banner = r#"
-    ██████╗ ██╗   ██╗███╗   ██╗████████╗
-    ██╔══██╗██║   ██║████╗  ██║╚══██╔══╝
-    ██████╔╝██║   ██║██╔██╗ ██║   ██║
-    ██╔═══╝ ██║   ██║██║╚██╗██║   ██║
-    ██║     ╚██████╔╝██║ ╚████║   ██║
-    ╚═╝      ╚═════╝ ╚═╝  ╚═══╝   ╚═╝"#;
-
-    println!("{}", banner.cyan().bold());
-    println!(
-        "    {}",
-        "Port Utility for Network Testing v0.1".white().dimmed()
-    );
-
-    let taglines = [
-        "because nmap was too mainstream",
-        "RST packets go brrrrr",
-        "now with 100% more Rust",
-        "blazingly fast (we're contractually obligated to say that)",
-        "i am not scraping your data, i don't know how",
-    ];
-
-    let mut rng = rand::rng();
-    if let Some(tagline) = taglines.choose(&mut rng) {
-        println!("    {}", format!("\"{}\"", tagline).dimmed().italic());
-    }
-    println!();
-}
-
-fn print_divider() {
-    println!("{}", "    ─────────────────────────────────────".dimmed());
-}
-
-async fn scan_port(addr: SocketAddr, conn_timeout: Duration, grab_banner: bool) -> Option<ScanResult> {
-    let port = addr.port();
-
-    let mut stream = match timeout(conn_timeout, TcpStream::connect(addr)).await {
-        Ok(Ok(s)) => s,
-        _ => return None,
-    };
-
-    if !grab_banner {
-        return Some(ScanResult {
-            port,
-            banner: None,
-            http_info: None,
-            tls_info: None,
-            findings: Vec::new(),
-        });
-    }
-
-    let mut buf = vec![0u8; 1024];
-    let banner = match timeout(Duration::from_secs(2), stream.read(&mut buf)).await {
-        Ok(Ok(n)) if n > 0 => {
-            let raw = String::from_utf8_lossy(&buf[..n]);
-            let cleaned: String = raw
-                .chars()
-                .filter(|c| !c.is_control() || *c == ' ')
-                .collect::<String>()
-                .trim()
-                .to_string();
-
-            if cleaned.is_empty() { None } else { Some(cleaned) }
-        }
-        _ => None,
-    };
-
-    Some(ScanResult {
-        port,
-        banner,
-        http_info: None,
-        tls_info: None,
-        findings: Vec::new(),
-    })
-}
-
-async fn probe_http(target: &str, port: u16, conn_timeout: Duration) -> Option<HttpInfo> {
-    let schemes = if matches!(port, 443 | 8443 | 8006 | 9443) {
-        vec!["https", "http"]
-    } else {
-        vec!["http", "https"]
-    };
-
-    let client = reqwest::Client::builder()
-        .timeout(conn_timeout)
-        .danger_accept_invalid_certs(true)
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .ok()?;
-
-    for scheme in schemes {
-        let url = format!("{}://{}:{}/", scheme, target, port);
-
-        if let Ok(resp) = client.get(&url).send().await {
-            let status = resp.status().as_u16();
-
-            let mut headers = HashMap::new();
-            for (key, value) in resp.headers() {
-                if let Ok(val_str) = value.to_str() {
-                    headers.insert(
-                        key.as_str().to_lowercase(),
-                        val_str.to_string(),
-                    );
-                }
-            }
-
-            return Some(HttpInfo {
-                status,
-                headers,
-                scheme: scheme.to_string(),
-            });
-        }
-    }
-
-    None
-}
-
-fn format_duration(duration: Duration) -> String {
-    let total_secs = duration.as_secs_f64();
-    if total_secs < 1.0 {
-        format!("{:.0}ms", total_secs * 1000.0)
-    } else if total_secs < 60.0 {
-        format!("{:.2}s", total_secs)
-    } else {
-        let mins = (total_secs / 60.0).floor() as u64;
-        let secs = total_secs % 60.0;
-        format!("{}m {:.2}s", mins, secs)
-    }
-}
-
-use serde::Serialize;
-
-#[derive(Serialize)]
-struct JsonOutput {
-    target: String,
-    ports_scanned: u64,
-    scan_duration: String,
-    results: Vec<JsonPortResult>,
-}
-
-#[derive(Serialize)]
-struct JsonPortResult {
-    port: u16,
-    state: String,
-    banner: Option<String>,
-    http: Option<JsonHttp>,
-    tls: Option<JsonTls>,
-    findings: Vec<JsonFinding>,
-}
-
-#[derive(Serialize)]
-struct JsonHttp {
-    status: u16,
-    scheme: String,
-    headers: HashMap<String, String>,
-}
-
-#[derive(Serialize)]
-struct JsonTls {
-    subject: String,
-    issuer: String,
-    not_before: String,
-    not_after: String,
-    days_until_expiry: i64,
-    sans: Vec<String>,
-    tls_version: String,
-    cipher_suite: String,
-    self_signed: bool,
-}
-
-#[derive(Serialize)]
-struct JsonFinding {
-    severity: String,
-    title: String,
-    detail: String,
+struct HostResult {
+    host: String,
+    results: Vec<models::ScanResult>,
 }
 
 #[tokio::main]
-
 async fn main() {
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("Failed to install crypto provider");
-    
-    let args = Args::parse();
-    let conn_timeout = Duration::from_millis(args.timeout);
-    let total_ports = (args.end_port - args.start_port + 1) as u64;
 
-    let do_probe = args.probe || args.audit;
-    let do_audit = args.audit || args.tls;
-
-// Enable ANSI color support on Windows
     #[cfg(windows)]
     {
         let _ = colored::control::set_virtual_terminal(true);
     }
 
+    let args = Args::parse();
+    let conn_timeout = Duration::from_millis(args.timeout);
+    let ports_per_host = (args.end_port - args.start_port + 1) as u64;
+
+    let do_probe = args.probe || args.audit;
+    let do_audit = args.audit || args.tls;
+
+    // Parse targets
+    let targets = match target::parse_targets(&args.target) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("    {} {}", "ERROR:".red().bold(), e);
+            std::process::exit(1);
+        }
+    };
+
+    let is_cidr = targets.len() > 1;
+
+    // Host discovery for CIDR ranges
+    let live_targets = if is_cidr {
+        println!(
+            "    {} discovering live hosts in {} ({} addresses)...",
+            "→".cyan(),
+            args.target.yellow(),
+            targets.len().to_string().white()
+        );
+
+        let discovery_progress = ProgressBar::new(targets.len() as u64);
+        discovery_progress.set_style(
+            ProgressStyle::default_bar()
+                .template("    {spinner:.yellow} [{bar:40.yellow/white}] {pos}/{len} hosts ({percent}%) | ETA: {eta}")
+                .expect("Invalid progress bar template")
+                .progress_chars("█▓░")
+        );
+
+        let mut live: Vec<std::net::IpAddr> = Vec::new();
+
+        for chunk in targets.chunks(50) {
+            let mut tasks = Vec::new();
+
+            for ip in chunk {
+                let ip = *ip;
+                tasks.push(async move {
+                    let alive = target::is_host_alive(ip, args.timeout).await;
+                    (ip, alive)
+                });
+            }
+
+            let results = futures::future::join_all(tasks).await;
+
+            for (ip, alive) in results {
+                if alive {
+                    live.push(ip);
+                }
+            }
+
+            discovery_progress.inc(chunk.len() as u64);
+        }
+
+        discovery_progress.finish_and_clear();
+
+        println!(
+            "    {} {} live hosts found\n",
+            "✓".green().bold(),
+            live.len().to_string().green().bold()
+        );
+
+        live
+    } else {
+        targets.clone()
+    };
+
+    let total_ports = ports_per_host * live_targets.len() as u64;
+
     print_banner();
     print_divider();
 
+    if is_cidr {
+        println!(
+            "    {} {} ({} live / {} total)",
+            "TARGET:".bold(),
+            args.target.yellow(),
+            live_targets.len().to_string().green(),
+            targets.len().to_string().dimmed()
+        );
+    } else {
+        println!(
+            "    {} {}",
+            "TARGET:".bold(),
+            targets[0].to_string().yellow()
+        );
+    }
+
     println!(
-        "    {} {}",
-        "TARGET:".bold(),
-        args.target.yellow()
-    );
-    println!(
-        "    {} {}-{} ({})",
+        "    {} {}-{} ({} per host, {} total)",
         "RANGE:".bold(),
         args.start_port.to_string().white(),
         args.end_port.to_string().white(),
+        format!("{} ports", ports_per_host).dimmed(),
         format!("{} ports", total_ports).dimmed()
     );
     println!(
@@ -693,124 +195,162 @@ async fn main() {
     print_divider();
     println!();
 
-    // Phase 1: Port scan
-    let progress = ProgressBar::new(total_ports);
-    progress.set_style(
-        ProgressStyle::default_bar()
-            .template("    {spinner:.cyan} [{bar:40.cyan/blue}] {pos}/{len} ports ({percent}%) | ETA: {eta}")
-            .expect("Invalid progress bar template")
-            .progress_chars("█▓░")
-    );
-
     let start_time = Instant::now();
-    let mut results: Vec<ScanResult> = Vec::new();
+    let mut all_host_results: Vec<HostResult> = Vec::new();
 
-    for batch_start in (args.start_port..=args.end_port).step_by(args.batch_size) {
-        let batch_end =
-            (batch_start as usize + args.batch_size - 1).min(args.end_port as usize) as u16;
+    for (_host_idx, host_ip) in live_targets.iter().enumerate() {
+        let host = host_ip.to_string();
 
-        let mut tasks = Vec::new();
-
-        for port in batch_start..=batch_end {
-            let addr: SocketAddr = format!("{}:{}", args.target, port)
-                .parse()
-                .expect("Invalid address");
-
-            tasks.push(scan_port(addr, conn_timeout, args.banners));
+        // ── Phase 1: Port scan ──
+        let progress = ProgressBar::new(ports_per_host);
+        if is_cidr {
+            progress.set_style(
+                ProgressStyle::default_bar()
+                    .template(&format!(
+                        "    {{spinner:.cyan}} {} [{{bar:30.cyan/blue}}] {{pos}}/{{len}} ({{percent}}%) | ETA: {{eta}}",
+                        host.yellow()
+                    ))
+                    .expect("Invalid progress bar template")
+                    .progress_chars("█▓░")
+            );
+        } else {
+            progress.set_style(
+                ProgressStyle::default_bar()
+                    .template("    {spinner:.cyan} [{bar:40.cyan/blue}] {pos}/{len} ports ({percent}%) | ETA: {eta}")
+                    .expect("Invalid progress bar template")
+                    .progress_chars("█▓░")
+            );
         }
 
-        let batch_results = futures::future::join_all(tasks).await;
-        let batch_count = batch_results.len() as u64;
+        let mut results: Vec<models::ScanResult> = Vec::new();
 
-        for result in batch_results {
-            if let Some(scan_result) = result {
-                results.push(scan_result);
+        for batch_start in (args.start_port..=args.end_port).step_by(args.batch_size) {
+            let batch_end =
+                (batch_start as usize + args.batch_size - 1).min(args.end_port as usize) as u16;
+
+            let mut tasks = Vec::new();
+
+            for port in batch_start..=batch_end {
+                let addr: SocketAddr = format!("{}:{}", host, port)
+                    .parse()
+                    .expect("Invalid address");
+
+                tasks.push(scanner::scan_port(addr, conn_timeout, args.banners));
+            }
+
+            let batch_results = futures::future::join_all(tasks).await;
+            let batch_count = batch_results.len() as u64;
+
+            for result in batch_results {
+                if let Some(scan_result) = result {
+                    results.push(scan_result);
+                }
+            }
+
+            progress.inc(batch_count);
+        }
+
+        progress.finish_and_clear();
+
+        // ── Phase 2: HTTP probing ──
+        if do_probe && !results.is_empty() {
+            let probe_progress = ProgressBar::new(results.len() as u64);
+            probe_progress.set_style(
+                ProgressStyle::default_bar()
+                    .template("    {spinner:.magenta} [{bar:40.magenta/red}] {pos}/{len} probed | ETA: {eta}")
+                    .expect("Invalid progress bar template")
+                    .progress_chars("█▓░")
+            );
+
+            let probe_timeout = Duration::from_secs(5);
+
+            for result in results.iter_mut() {
+                result.http_info = probe::probe_http(&host, result.port, probe_timeout).await;
+                probe_progress.inc(1);
+            }
+
+            probe_progress.finish_and_clear();
+        }
+
+        // ── Phase 3: TLS inspection ──
+        if args.tls && !results.is_empty() {
+            let tls_progress = ProgressBar::new(results.len() as u64);
+            tls_progress.set_style(
+                ProgressStyle::default_bar()
+                    .template("    {spinner:.green} [{bar:40.green/white}] {pos}/{len} inspected | ETA: {eta}")
+                    .expect("Invalid progress bar template")
+                    .progress_chars("█▓░")
+            );
+
+            let tls_timeout = Duration::from_secs(5);
+
+            for result in results.iter_mut() {
+                result.tls_info = tls::inspect_tls(&host, result.port, tls_timeout).await;
+                tls_progress.inc(1);
+            }
+
+            tls_progress.finish_and_clear();
+        }
+
+        // ── Phase 4: Audit ──
+        if do_audit {
+            for result in results.iter_mut() {
+                if let Some(info) = &result.http_info {
+                    result.findings.extend(audit::audit_headers(result.port, info));
+                }
+                if let Some(info) = &result.tls_info {
+                    result.findings.extend(audit::audit_tls(result.port, info));
+                }
             }
         }
 
-        progress.inc(batch_count);
-    }
+        results.sort_by_key(|r| r.port);
 
-    progress.finish_and_clear();
-
-    // Phase 2: HTTP probing
-    if do_probe && !results.is_empty() {
-        println!(
-            "    {} probing {} open {} for HTTP/HTTPS...",
-            "→".cyan(),
-            results.len(),
-            if results.len() == 1 { "port" } else { "ports" }
-        );
-
-        let probe_progress = ProgressBar::new(results.len() as u64);
-        probe_progress.set_style(
-            ProgressStyle::default_bar()
-                .template("    {spinner:.magenta} [{bar:40.magenta/red}] {pos}/{len} probed | ETA: {eta}")
-                .expect("Invalid progress bar template")
-                .progress_chars("█▓░")
-        );
-
-        let probe_timeout = Duration::from_secs(5);
-
-        for result in results.iter_mut() {
-            result.http_info = probe_http(&args.target, result.port, probe_timeout).await;
-            probe_progress.inc(1);
+        // Per-host inline summary during scan phase
+        if is_cidr && !results.is_empty() {
+            let ports_list: Vec<String> = results.iter()
+                .map(|r| r.port.to_string())
+                .collect();
+            println!(
+                "    {} {} — {} open: {}",
+                "►".cyan(),
+                host.yellow(),
+                results.len().to_string().green().bold(),
+                ports_list.join(", ").dimmed()
+            );
+        } else if is_cidr {
+            println!(
+                "    {} {} — {}",
+                "►".dimmed(),
+                host.to_string().dimmed(),
+                "no open ports".dimmed()
+            );
         }
 
-        probe_progress.finish_and_clear();
-    }
-
-    // Phase 3: TLS inspection
-    if args.tls && !results.is_empty() {
-        println!(
-            "    {} inspecting TLS on {} open {}...",
-            "→".cyan(),
-            results.len(),
-            if results.len() == 1 { "port" } else { "ports" }
-        );
-
-        let tls_progress = ProgressBar::new(results.len() as u64);
-        tls_progress.set_style(
-            ProgressStyle::default_bar()
-                .template("    {spinner:.green} [{bar:40.green/white}] {pos}/{len} inspected | ETA: {eta}")
-                .expect("Invalid progress bar template")
-                .progress_chars("█▓░")
-        );
-
-        let tls_timeout = Duration::from_secs(5);
-
-        for result in results.iter_mut() {
-            result.tls_info = inspect_tls(&args.target, result.port, tls_timeout).await;
-            tls_progress.inc(1);
-        }
-
-        tls_progress.finish_and_clear();
-    }
-
-    // Phase 4: Audit
-    if do_audit {
-        for result in results.iter_mut() {
-            if let Some(info) = &result.http_info {
-                result.findings.extend(audit_headers(result.port, info));
-            }
-            if let Some(info) = &result.tls_info {
-                result.findings.extend(audit_tls(result.port, info));
-            }
+        // Store results for display phase
+        if !results.is_empty() {
+            all_host_results.push(HostResult { host, results });
         }
     }
 
     let elapsed = start_time.elapsed();
 
-    results.sort_by_key(|r| r.port);
-
-    // ── Results table ──
-    println!("    {}", "RESULTS".bold().underline());
+    // ── Display detailed results ──
     println!();
 
-    if results.is_empty() {
-        println!("    {} No open ports found. Either it's locked down", "¯\\_(ツ)_/¯".yellow());
-        println!("    or something went wrong. Try a longer timeout?");
-    } else {
+    for host_result in &all_host_results {
+        let results = &host_result.results;
+        let host = &host_result.host;
+
+        if is_cidr {
+            println!("    {} {}", "═══".cyan(), host.bold().yellow());
+            println!();
+        }
+
+        // Results table
+        println!("    {}", "RESULTS".bold().underline());
+        println!();
+
         let show_banner = args.banners;
         let show_probe = do_probe;
 
@@ -824,7 +364,7 @@ async fn main() {
         if show_probe { print!(" {}", "────"); }
         println!();
 
-        for result in &results {
+        for result in results {
             print!(
                 "    {:<12} {:<10}",
                 format!("{}/tcp", result.port),
@@ -857,9 +397,9 @@ async fn main() {
             println!();
         }
 
-        // ── Headers section ──
+        // Headers
         if show_probe {
-            let http_results: Vec<&ScanResult> = results
+            let http_results: Vec<&models::ScanResult> = results
                 .iter()
                 .filter(|r| r.http_info.is_some())
                 .collect();
@@ -898,9 +438,9 @@ async fn main() {
             }
         }
 
-        // ── TLS section ──
+        // TLS
         if args.tls {
-            let tls_results: Vec<&ScanResult> = results
+            let tls_results: Vec<&models::ScanResult> = results
                 .iter()
                 .filter(|r| r.tls_info.is_some())
                 .collect();
@@ -924,7 +464,6 @@ async fn main() {
                     println!("      {}: {}", "Issuer".dimmed(), info.issuer);
                     println!("      {}: {}", "Not Before".dimmed(), info.not_before);
 
-                    // Color the expiry based on urgency
                     let expiry_display = if info.days_until_expiry < 0 {
                         format!("{} (EXPIRED {} days ago)", info.not_after, info.days_until_expiry.abs()).red().to_string()
                     } else if info.days_until_expiry <= 30 {
@@ -942,19 +481,14 @@ async fn main() {
                         println!("      {}", "⚠ Self-signed certificate".yellow());
                     }
                 }
-            } else {
-                println!();
-                println!("    {}", "TLS CERTIFICATES".bold().underline());
-                println!();
-                println!("    {} No TLS services detected on open ports.", "—".dimmed());
             }
         }
 
-        // ── Audit section ──
+        // Audit
         if do_audit {
-            let all_findings: Vec<(&ScanResult, &Finding)> = results
+            let all_findings: Vec<&models::Finding> = results
                 .iter()
-                .flat_map(|r| r.findings.iter().map(move |f| (r, f)))
+                .flat_map(|r| r.findings.iter())
                 .collect();
 
             if !all_findings.is_empty() {
@@ -963,11 +497,11 @@ async fn main() {
                 println!();
 
                 let high_count = all_findings.iter()
-                    .filter(|(_, f)| f.severity == Severity::High).count();
+                    .filter(|f| f.severity == Severity::High).count();
                 let med_count = all_findings.iter()
-                    .filter(|(_, f)| f.severity == Severity::Medium).count();
+                    .filter(|f| f.severity == Severity::Medium).count();
                 let info_count = all_findings.iter()
-                    .filter(|(_, f)| f.severity == Severity::Info).count();
+                    .filter(|f| f.severity == Severity::Info).count();
 
                 println!(
                     "    {}  {}  {}",
@@ -977,79 +511,80 @@ async fn main() {
                 );
                 println!();
 
-                let highs: Vec<&(&ScanResult, &Finding)> = all_findings.iter()
-                    .filter(|(_, f)| f.severity == Severity::High).collect();
-                if !highs.is_empty() {
-                    for (_, finding) in &highs {
-                        println!(
-                            "    {} [{}] {}",
-                            finding.severity.icon(),
-                            finding.severity.label(),
-                            finding.title.bold()
-                        );
-                        println!("           {}", finding.detail.dimmed());
-                    }
-                    println!();
+                for finding in all_findings.iter().filter(|f| f.severity == Severity::High) {
+                    println!(
+                        "    {} [{}] {}",
+                        finding.severity.icon(),
+                        finding.severity.label(),
+                        finding.title.bold()
+                    );
+                    println!("           {}", finding.detail.dimmed());
                 }
+                if high_count > 0 { println!(); }
 
-                let meds: Vec<&(&ScanResult, &Finding)> = all_findings.iter()
-                    .filter(|(_, f)| f.severity == Severity::Medium).collect();
-                if !meds.is_empty() {
-                    for (_, finding) in &meds {
-                        println!(
-                            "    {} [{}]  {}",
-                            finding.severity.icon(),
-                            finding.severity.label(),
-                            finding.title.bold()
-                        );
-                        println!("           {}", finding.detail.dimmed());
-                    }
-                    println!();
+                for finding in all_findings.iter().filter(|f| f.severity == Severity::Medium) {
+                    println!(
+                        "    {} [{}]  {}",
+                        finding.severity.icon(),
+                        finding.severity.label(),
+                        finding.title.bold()
+                    );
+                    println!("           {}", finding.detail.dimmed());
                 }
+                if med_count > 0 { println!(); }
 
-                let infos: Vec<&(&ScanResult, &Finding)> = all_findings.iter()
-                    .filter(|(_, f)| f.severity == Severity::Info).collect();
-                if !infos.is_empty() {
-                    for (_, finding) in &infos {
-                        println!(
-                            "    {} [{}] {}",
-                            finding.severity.icon(),
-                            finding.severity.label(),
-                            finding.title
-                        );
-                        println!("           {}", finding.detail.dimmed());
-                    }
+                for finding in all_findings.iter().filter(|f| f.severity == Severity::Info) {
+                    println!(
+                        "    {} [{}] {}",
+                        finding.severity.icon(),
+                        finding.severity.label(),
+                        finding.title
+                    );
+                    println!("           {}", finding.detail.dimmed());
                 }
-            } else {
-                println!();
-                println!("    {}", "SECURITY AUDIT".bold().underline());
-                println!();
-                println!("    {} No findings. Looking solid.", "✓".green().bold());
             }
+        }
+
+        if is_cidr {
+            println!();
         }
     }
 
-    println!();
     print_divider();
 
-    // Summary
-    let port_count = results.len();
-    let summary_color = if port_count == 0 {
+    // ── Summary ──
+    let total_open: usize = all_host_results.iter().map(|h| h.results.len()).sum();
+    let hosts_with_ports = all_host_results.len();
+
+    let summary_color = if total_open == 0 {
         "0".dimmed().to_string()
-    } else if port_count <= 5 {
-        port_count.to_string().green().bold().to_string()
-    } else if port_count <= 20 {
-        port_count.to_string().yellow().bold().to_string()
+    } else if total_open <= 5 {
+        total_open.to_string().green().bold().to_string()
+    } else if total_open <= 20 {
+        total_open.to_string().yellow().bold().to_string()
     } else {
-        port_count.to_string().red().bold().to_string()
+        total_open.to_string().red().bold().to_string()
     };
 
-    println!(
-        "    {} open {} on {}",
-        summary_color,
-        if port_count == 1 { "port" } else { "ports" },
-        args.target.bold()
-    );
+    if is_cidr {
+        println!(
+            "    {} open ports across {} hosts ({} alive, {} in range)",
+            summary_color,
+            hosts_with_ports.to_string().bold(),
+            live_targets.len().to_string().green(),
+            targets.len().to_string().dimmed()
+        );
+    } else {
+        println!(
+            "    {} open {} on {}",
+            summary_color,
+            if total_open == 1 { "port" } else { "ports" },
+            all_host_results.first()
+                .map(|h| h.host.as_str())
+                .unwrap_or(&args.target).bold()
+        );
+    }
+
     println!(
         "    {} ports scanned in {}",
         total_ports.to_string().bold(),
@@ -1057,8 +592,12 @@ async fn main() {
     );
 
     if do_audit {
-        let total_findings: usize = results.iter().map(|r| r.findings.len()).sum();
-        let high_total: usize = results.iter()
+        let total_findings: usize = all_host_results.iter()
+            .flat_map(|h| h.results.iter())
+            .map(|r| r.findings.len())
+            .sum();
+        let high_total: usize = all_host_results.iter()
+            .flat_map(|h| h.results.iter())
             .flat_map(|r| r.findings.iter())
             .filter(|f| f.severity == Severity::High)
             .count();
@@ -1072,52 +611,60 @@ async fn main() {
         }
     }
 
-// JSON output
+    // ── JSON output ──
     if args.json {
-        let json_results: Vec<JsonPortResult> = results.iter().map(|r| {
-            JsonPortResult {
-                port: r.port,
-                state: "open".to_string(),
-                banner: r.banner.clone(),
-                http: r.http_info.as_ref().map(|h| JsonHttp {
-                    status: h.status,
-                    scheme: h.scheme.clone(),
-                    headers: h.headers.clone(),
-                }),
-                tls: r.tls_info.as_ref().map(|t| JsonTls {
-                    subject: t.subject.clone(),
-                    issuer: t.issuer.clone(),
-                    not_before: t.not_before.clone(),
-                    not_after: t.not_after.clone(),
-                    days_until_expiry: t.days_until_expiry,
-                    sans: t.sans.clone(),
-                    tls_version: t.tls_version.clone(),
-                    cipher_suite: t.cipher_suite.clone(),
-                    self_signed: t.self_signed,
-                }),
-                findings: r.findings.iter().map(|f| JsonFinding {
-                    severity: match f.severity {
-                        Severity::High => "high",
-                        Severity::Medium => "medium",
-                        Severity::Info => "info",
-                    }.to_string(),
-                    title: f.title.clone(),
-                    detail: f.detail.clone(),
-                }).collect(),
-            }
+        let json_hosts: Vec<serde_json::Value> = all_host_results.iter().map(|hr| {
+            let json_results: Vec<JsonPortResult> = hr.results.iter().map(|r| {
+                JsonPortResult {
+                    port: r.port,
+                    state: "open".to_string(),
+                    banner: r.banner.clone(),
+                    http: r.http_info.as_ref().map(|h| JsonHttp {
+                        status: h.status,
+                        scheme: h.scheme.clone(),
+                        headers: h.headers.clone(),
+                    }),
+                    tls: r.tls_info.as_ref().map(|t| JsonTls {
+                        subject: t.subject.clone(),
+                        issuer: t.issuer.clone(),
+                        not_before: t.not_before.clone(),
+                        not_after: t.not_after.clone(),
+                        days_until_expiry: t.days_until_expiry,
+                        sans: t.sans.clone(),
+                        tls_version: t.tls_version.clone(),
+                        cipher_suite: t.cipher_suite.clone(),
+                        self_signed: t.self_signed,
+                    }),
+                    findings: r.findings.iter().map(|f| JsonFinding {
+                        severity: match f.severity {
+                            Severity::High => "high",
+                            Severity::Medium => "medium",
+                            Severity::Info => "info",
+                        }.to_string(),
+                        title: f.title.clone(),
+                        detail: f.detail.clone(),
+                    }).collect(),
+                }
+            }).collect();
+
+            serde_json::json!({
+                "host": hr.host,
+                "results": json_results,
+            })
         }).collect();
 
-        let output = JsonOutput {
-            target: args.target.clone(),
-            ports_scanned: total_ports,
-            scan_duration: format_duration(elapsed),
-            results: json_results,
-        };
+        let json_output = serde_json::json!({
+            "target": args.target,
+            "hosts_total": targets.len(),
+            "hosts_alive": live_targets.len(),
+            "ports_per_host": ports_per_host,
+            "scan_duration": format_duration(elapsed),
+            "hosts": json_hosts,
+        });
 
-        let json_string = serde_json::to_string_pretty(&output).expect("Failed to serialize JSON");
+        let json_string = serde_json::to_string_pretty(&json_output).expect("Failed to serialize JSON");
 
-        // Write to file
-        let filename = format!("punt_{}.json", args.target.replace(".", "_"));
+        let filename = format!("punt_{}.json", args.target.replace("/", "_").replace(".", "_"));
         std::fs::write(&filename, &json_string).expect("Failed to write JSON file");
         println!(
             "    {} saved to {}",
@@ -1126,15 +673,5 @@ async fn main() {
         );
     }
 
-    let signoffs = [
-        "good luck!",
-        "scan responsibly... or don't, I'm a CLI not a cop.",
-        "done. go touch grass.",
-        "that's all folks.",
-    ];
-
-    let mut rng = rand::rng();
-    if let Some(signoff) = signoffs.choose(&mut rng) {
-        println!("\n    {}\n", signoff.dimmed().italic());
-    }
+    print_signoff();
 }
