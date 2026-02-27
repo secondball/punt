@@ -653,6 +653,12 @@ async fn main() {
     let do_probe = args.probe || args.audit;
     let do_audit = args.audit || args.tls;
 
+// Enable ANSI color support on Windows
+    #[cfg(windows)]
+    {
+        let _ = colored::control::set_virtual_terminal(true);
+    }
+
     print_banner();
     print_divider();
 
